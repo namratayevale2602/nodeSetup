@@ -1,275 +1,335 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 
-// Generate JWT Token
-const generateToken = (user) => {
-  return jwt.sign(
-    { id: user.id, email: user.email, role: user.role },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRE }
-  );
+// Generate Access Token
+const generateAccessToken = (user) => {
+    return jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        process.env.JWT_ACCESS_SECRET,
+        { expiresIn: process.env.JWT_ACCESS_EXPIRE || '1h' }
+    );
 };
 
-// @desc    Register new user
-// @route   POST /api/users/register
-// @access  Public
+// Generate Refresh Token
+const generateRefreshToken = (user) => {
+    return jwt.sign(
+        { id: user.id, email: user.email, tokenType: 'refresh' },
+        process.env.JWT_REFRESH_SECRET,
+        { expiresIn: process.env.JWT_REFRESH_EXPIRE || '7d' }
+    );
+};
+
+// Set Cookies
+const setTokenCookies = (res, accessToken, refreshToken) => {
+    const isProduction = process.env.NODE_ENV === 'production';
+    
+    res.cookie('access_token', accessToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax',
+        maxAge: 60 * 60 * 1000, // 1 hour
+        path: '/'
+    });
+    
+    res.cookie('refresh_token', refreshToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        path: '/'
+    });
+};
+
+// Register User
 const registerUser = async (req, res) => {
-  try {
-    const { name, email, password, role } = req.body;
+    try {
+        const { name, email, password, role } = req.body; // Add role to destructuring
 
-    // Check if user already exists
-    const existingUser = await User.findOne({ where: { email } });
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email already registered'
-      });
+        // Validate input
+        if (!name || !email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide name, email and password'
+            });
+        }
+
+        // Check if user exists
+        const existingUser = await User.findOne({ where: { email } });
+        if (existingUser) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email already registered'
+            });
+        }
+
+        // Create user with role (only allow admin role if specified, otherwise default to user)
+        const userData = {
+            name,
+            email,
+            password
+        };
+        
+        // Only allow setting role to admin (for security, you might want to restrict this)
+        if (role === 'admin') {
+            userData.role = 'admin';
+        }
+
+        const user = await User.create(userData);
+
+        // Generate tokens
+        const accessToken = generateAccessToken(user);
+        const refreshToken = generateRefreshToken(user);
+        
+        // Calculate refresh token expiry (7 days from now)
+        const refreshTokenExpiry = new Date();
+        refreshTokenExpiry.setDate(refreshTokenExpiry.getDate() + 7);
+        
+        // Store refresh token in database
+        await user.update({
+            refreshToken,
+            refreshTokenExpiry
+        });
+        
+        // Set cookies
+        setTokenCookies(res, accessToken, refreshToken);
+
+        res.status(201).json({
+            success: true,
+            message: 'User registered successfully',
+            data: {
+                user: user.getPublicProfile(),
+                accessToken
+            }
+        });
+    } catch (error) {
+        console.error('Register error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error registering user',
+            error: error.message
+        });
     }
-
-    // Create user
-    const user = await User.create({
-      name,
-      email,
-      password,
-      role: role || 'user'
-    });
-
-    // Generate token
-    const token = generateToken(user);
-
-    res.status(201).json({
-      success: true,
-      message: 'User registered successfully',
-      data: {
-        user: user.getPublicProfile(),
-        token
-      }
-    });
-  } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error registering user',
-      error: error.message
-    });
-  }
 };
 
-// @desc    Login user
-// @route   POST /api/users/login
-// @access  Public
+// Login User
 const loginUser = async (req, res) => {
-  try {
-    const { email, password } = req.body;
+    try {
+        const { email, password } = req.body;
 
-    // Check if user exists
-    const user = await User.findOne({ where: { email } });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide email and password'
+            });
+        }
+
+        // Find user
+        const user = await User.findOne({ where: { email } });
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
+        }
+
+        // Check password
+        const isPasswordValid = await user.comparePassword(password);
+        if (!isPasswordValid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
+        }
+
+        // Check if active
+        if (!user.isActive) {
+            return res.status(401).json({
+                success: false,
+                message: 'Account is deactivated'
+            });
+        }
+
+        // Generate tokens
+        const accessToken = generateAccessToken(user);
+        const refreshToken = generateRefreshToken(user);
+        
+        // Calculate refresh token expiry
+        const refreshTokenExpiry = new Date();
+        refreshTokenExpiry.setDate(refreshTokenExpiry.getDate() + 7);
+        
+        // Update refresh token in database
+        await user.update({
+            refreshToken,
+            refreshTokenExpiry,
+            lastLogin: new Date()
+        });
+        
+        // Set cookies
+        setTokenCookies(res, accessToken, refreshToken);
+
+        res.status(200).json({
+            success: true,
+            message: 'Login successful',
+            data: {
+                user: user.getPublicProfile(),
+                accessToken
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error logging in',
+            error: error.message
+        });
     }
-
-    // Check password
-    const isPasswordValid = await user.comparePassword(password);
-    if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
-    }
-
-    // Check if user is active
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'Account is deactivated'
-      });
-    }
-
-    // Generate token
-    const token = generateToken(user);
-
-    res.status(200).json({
-      success: true,
-      message: 'Login successful',
-      data: {
-        user: user.getPublicProfile(),
-        token
-      }
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error logging in',
-      error: error.message
-    });
-  }
 };
 
-// @desc    Get all users
-// @route   GET /api/users
-// @access  Private/Admin
+// Get All Users
 const getAllUsers = async (req, res) => {
-  try {
-    const users = await User.findAll({
-      attributes: { exclude: ['password', 'deletedAt'] }
-    });
+    try {
+        const users = await User.findAll({
+            attributes: { exclude: ['password', 'refreshToken', 'refreshTokenExpiry', 'deletedAt'] }
+        });
 
-    res.status(200).json({
-      success: true,
-      count: users.length,
-      data: users
-    });
-  } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching users',
-      error: error.message
-    });
-  }
+        res.status(200).json({
+            success: true,
+            count: users.length,
+            data: users
+        });
+    } catch (error) {
+        console.error('Get users error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching users',
+            error: error.message
+        });
+    }
 };
 
-// @desc    Get user by ID
-// @route   GET /api/users/:id
-// @access  Private
-const getUserById = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const user = await User.findByPk(id, {
-      attributes: { exclude: ['password', 'deletedAt'] }
-    });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: user
-    });
-  } catch (error) {
-    console.error('Get user error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching user',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Update user
-// @route   PUT /api/users/:id
-// @access  Private
-const updateUser = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updates = req.body;
-
-    // Prevent updating sensitive fields
-    delete updates.password;
-    delete updates.id;
-    delete updates.createdAt;
-
-    const user = await User.findByPk(id);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-
-    // Check if user is updating their own profile or is admin
-    if (req.user.id !== id && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to update this user'
-      });
-    }
-
-    await user.update(updates);
-
-    res.status(200).json({
-      success: true,
-      message: 'User updated successfully',
-      data: user.getPublicProfile()
-    });
-  } catch (error) {
-    console.error('Update user error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error updating user',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Delete user (soft delete)
-// @route   DELETE /api/users/:id
-// @access  Private/Admin
-const deleteUser = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const user = await User.findByPk(id);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-
-    await user.destroy();
-
-    res.status(200).json({
-      success: true,
-      message: 'User deleted successfully'
-    });
-  } catch (error) {
-    console.error('Delete user error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error deleting user',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Get current user profile
-// @route   GET /api/users/me
-// @access  Private
+// Get Current User
 const getMe = async (req, res) => {
-  try {
-    const user = await User.findByPk(req.user.id, {
-      attributes: { exclude: ['password', 'deletedAt'] }
-    });
+    try {
+        res.status(200).json({
+            success: true,
+            data: req.user.getPublicProfile()
+        });
+    } catch (error) {
+        console.error('Get profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching profile',
+            error: error.message
+        });
+    }
+};
 
-    res.status(200).json({
-      success: true,
-      data: user
-    });
-  } catch (error) {
-    console.error('Get profile error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching profile',
-      error: error.message
-    });
-  }
+// Refresh Token
+const refreshAccessToken = async (req, res) => {
+    try {
+        const refreshToken = req.cookies.refresh_token;
+        
+        if (!refreshToken) {
+            return res.status(401).json({
+                success: false,
+                message: 'No refresh token provided'
+            });
+        }
+        
+        // Verify refresh token
+        let decoded;
+        try {
+            decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+        } catch (error) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid or expired refresh token'
+            });
+        }
+        
+        // Find user with this refresh token
+        const user = await User.findOne({
+            where: {
+                id: decoded.id,
+                refreshToken: refreshToken
+            }
+        });
+        
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid refresh token'
+            });
+        }
+        
+        // Check if refresh token is expired
+        if (user.refreshTokenExpiry && new Date() > user.refreshTokenExpiry) {
+            return res.status(401).json({
+                success: false,
+                message: 'Refresh token expired, please login again'
+            });
+        }
+        
+        // Generate new access token
+        const newAccessToken = generateAccessToken(user);
+        
+        // Set new access token in cookie
+        res.cookie('access_token', newAccessToken, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            maxAge: 60 * 60 * 1000,
+            path: '/'
+        });
+        
+        res.status(200).json({
+            success: true,
+            message: 'Access token refreshed successfully',
+            data: { accessToken: newAccessToken }
+        });
+    } catch (error) {
+        console.error('Refresh token error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error refreshing token',
+            error: error.message
+        });
+    }
+};
+
+// Logout
+const logoutUser = async (req, res) => {
+    try {
+        if (req.user) {
+            await User.update(
+                { refreshToken: null, refreshTokenExpiry: null },
+                { where: { id: req.user.id } }
+            );
+        }
+        
+        res.clearCookie('access_token', { path: '/' });
+        res.clearCookie('refresh_token', { path: '/' });
+        
+        res.status(200).json({
+            success: true,
+            message: 'Logged out successfully'
+        });
+    } catch (error) {
+        console.error('Logout error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error logging out',
+            error: error.message
+        });
+    }
 };
 
 module.exports = {
-  registerUser,
-  loginUser,
-  getAllUsers,
-  getUserById,
-  updateUser,
-  deleteUser,
-  getMe
+    registerUser,
+    loginUser,
+    getAllUsers,
+    getMe,
+    refreshAccessToken,
+    logoutUser
 };
